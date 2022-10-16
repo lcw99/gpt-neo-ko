@@ -1,0 +1,6 @@
+{
+    "n_vocab": 50257,
+    "path": "./tf-data-wiki-kor-bpe/*.tfrecords",
+    "eval_path": "./tf-data-wiki-kor-bpe-eval/*.tfrecords",
+    "tokenizer_path": "./tokenizer-wiki-plus-namu-gpt-neo-ko/tokenizer.json"
+}

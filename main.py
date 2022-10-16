@@ -16,7 +16,7 @@ from tasks import task_descriptors
 import argparse
 import json
 import numpy
-
+import os
 
 def parse_args():
     # Parse command line arguments
@@ -49,6 +49,8 @@ def parse_args():
 
 
 def main(args):
+    os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
+    
     # Setup logging
     logger = setup_logging(args)
 

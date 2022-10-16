@@ -1,0 +1,1 @@
+python main.py --model ./configs/gpt-neo-small.json --steps_per_checkpoint 10000 --gpu_ids device:GPU:0 device:GPU:1 

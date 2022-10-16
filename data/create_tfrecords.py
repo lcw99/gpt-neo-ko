@@ -6,12 +6,14 @@ import ftfy
 import tensorflow as tf
 from lm_dataformat import Reader
 from tokenizers import Tokenizer
-from transformers import GPT2TokenizerFast
+from transformers import GPT2TokenizerFast, AutoTokenizer
 from tqdm import tqdm
 import logging
 from multiprocessing import Pool, cpu_count
 from itertools import repeat
 import re
+
+from datasets import load_dataset, load_metric, load_from_disk, Dataset
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
@@ -33,6 +35,7 @@ parser.add_argument("--chunk_size", type=int, default=2048, help="How big a chun
                                                                  "Should equal your model's context size")
 parser.add_argument("--write_dataset_config", action="store_true", help="Write the dataset config file on completion")
 parser.add_argument("--processes", type=int, default=0, help="Number of processes to use. Defaults to cpu count.")
+parser.add_argument("--from_hf_dataset", type=str, default="lcw99/wikipedia-korean-20221001", help="read data from huggingface")
 
 args = parser.parse_args()
 if not args.output_dir.endswith("/"):
@@ -41,6 +44,7 @@ if not args.input_dir.endswith("/"):
     args.input_dir = args.input_dir + "/"
 assert len(args.separator) == 1
 
+ds = None
 
 def wikitext_detokenizer(string):
     # contractions
@@ -93,13 +97,12 @@ def write_to_file(writer, data):
     tf_example = tf.train.Example(features=tf.train.Features(feature=feature))
     writer.write(tf_example.SerializeToString())
 
-
 def get_tokenizer(args):
     if args.encoder_path is None:
         return GPT2TokenizerFast.from_pretrained('gpt2')
     else:
-        return Tokenizer.from_file(args.encoder_path)
-
+        #return Tokenizer.from_file(args.encoder_path)
+        return AutoTokenizer.from_pretrained(args.encoder_path)
 
 def split_list(l, n):
     # splits list/string into n size chunks
@@ -109,6 +112,17 @@ def split_list(l, n):
 def archive_to_tokens(f, encoder, args, prefix=[]):
     # Generator that yields the contents of the files in an archive
     # if data_to_prepend is not None, prepend data_to_prepend + a EOS separator to the encoded data
+    if ds is not None:
+        doc = f
+        if args.ftfy:  # fix text with ftfy if specified
+            doc = ftfy.fix_text(doc, normalization='NFKC')
+        if args.wikitext_detokenize:
+            doc = wikitext_detokenizer(doc)
+        doc = encoder.encode(doc) + args.separator  # read document from lmd and append separator token
+        yield split_list(prefix + doc, args.chunk_size)  # split into n_ctx + 1 size chunks
+        prefix = []
+        return
+            
     reader = Reader(f)
     for doc in reader.stream_data(threaded=False):
         if args.ftfy:  # fix text with ftfy if specified
@@ -256,7 +270,12 @@ def create_tfrecords_mp(files, args):
 
 if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)  # make output dir if it doesn't exist
-    files = get_files(args.input_dir)
+    if args.from_hf_dataset is not None:
+        ds = load_dataset(args.from_hf_dataset)
+        ds = ds["train"]
+        files = [id for id in ds['text']]
+    else:
+        files = get_files(args.input_dir)
     args.chunk_size += 1  # we shift the data by 1 to the right for targets, so increment the chunk size here
 
     if args.processes == 0:
