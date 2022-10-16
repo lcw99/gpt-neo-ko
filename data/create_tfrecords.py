@@ -1,287 +1,259 @@
+"""GPT-like model in Mesh-Tensorflow"""
+
+from functools import partial
+import mesh_tensorflow as mtf
+import tensorflow.compat.v1 as tf
+from tensorflow.python.tpu import tpu_config, tpu_estimator
+from tensorflow_estimator.python.estimator import estimator as estimator_lib
+from utils import save_config, expand_attention_types_params, yes_or_no, remove_gs_or_filepath, setup_logging, \
+    check_dataset
+from inputs import sequential_input, pred_input, handle_pred_output, mlm_sample_text, generic_text
+from export import export_model
+from model_fns import model_fn
+from data.encoders import fetch_encoder
+from configs import fetch_model_params
+from tasks import task_descriptors
 import argparse
+import json
+import numpy
 import os
-from pathlib import Path
 
-import ftfy
-import tensorflow as tf
-from lm_dataformat import Reader
-from tokenizers import Tokenizer
-from transformers import GPT2TokenizerFast, AutoTokenizer
-from tqdm import tqdm
-import logging
-from multiprocessing import Pool, cpu_count
-from itertools import repeat
-import re
-
-from datasets import load_dataset, load_metric, load_from_disk, Dataset
-
-logging.getLogger("transformers").setLevel(logging.ERROR)
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--input_dir", type=str, help="Path to where your files are located. Files ending in .zst are "
-                                                  "treated as archives, all others as raw text.")
-parser.add_argument("--files_per", type=int, default=100000, help="Text files per tfrecord")
-parser.add_argument("--name", type=str, default="openwebtext",
-                    help="Name of output files will be name_i.tfrecords where i is the number of the file")
-parser.add_argument("--output_dir", type=str, default="./tfrecords", help="Where to put tfrecords")
-parser.add_argument("--encoder_path", type=str,
-                    help="Path to encoder files, or leave unspecified to use GPT2 tokenizer")
-parser.add_argument("--minimum_size", type=int, default=100, help="Minimum size a document has to be to be included")
-parser.add_argument("--ftfy", action="store_false", help="normalize with ftfy")
-parser.add_argument("--wikitext-detokenize", action="store_false", help="use wikitext detokenizer")
-parser.add_argument("--separator", nargs="+", type=int, default=[50256],
-                    help="separator to place between files in chunk mode")
-parser.add_argument("--chunk_size", type=int, default=2048, help="How big a chunk should be in chunk mode. "
-                                                                 "Should equal your model's context size")
-parser.add_argument("--write_dataset_config", action="store_true", help="Write the dataset config file on completion")
-parser.add_argument("--processes", type=int, default=0, help="Number of processes to use. Defaults to cpu count.")
-parser.add_argument("--from_hf_dataset", type=str, default="lcw99/wikipedia-korean-20221001", help="read data from huggingface")
-
-args = parser.parse_args()
-if not args.output_dir.endswith("/"):
-    args.output_dir = args.output_dir + "/"
-if not args.input_dir.endswith("/"):
-    args.input_dir = args.input_dir + "/"
-assert len(args.separator) == 1
-
-ds = None
-
-def wikitext_detokenizer(string):
-    # contractions
-    string = string.replace("s '", "s'")
-    string = re.sub(r"/' [0-9]/", r"/'[0-9]/", string)
-    # number separators
-    string = string.replace(" @-@ ", "-")
-    string = string.replace(" @,@ ", ",")
-    string = string.replace(" @.@ ", ".")
-    # punctuation
-    string = string.replace(" : ", ": ")
-    string = string.replace(" ; ", "; ")
-    string = string.replace(" . ", ". ")
-    string = string.replace(" ! ", "! ")
-    string = string.replace(" ? ", "? ")
-    string = string.replace(" , ", ", ")
-    # double brackets
-    string = re.sub(r"\(\s*([^\)]*?)\s*\)", r"(\1)", string)
-    string = re.sub(r"\[\s*([^\]]*?)\s*\]", r"[\1]", string)
-    string = re.sub(r"{\s*([^}]*?)\s*}", r"{\1}", string)
-    string = re.sub(r"\"\s*([^\"]*?)\s*\"", r'"\1"', string)
-    string = re.sub(r"'\s*([^']*?)\s*'", r"'\1'", string)
-    # miscellaneous
-    string = string.replace("= = = =", "====")
-    string = string.replace("= = =", "===")
-    string = string.replace("= =", "==")
-    string = string.replace(" " + chr(176) + " ", chr(176))
-    string = string.replace(" \n", "\n")
-    string = string.replace("\n ", "\n")
-    string = string.replace(" N ", " 1 ")
-    string = string.replace(" 's", "'s")
-
-    return string
+def parse_args():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tpu", type=str, help="Name of TPU to train on, if any.")
+    parser.add_argument("--gpu_ids", nargs="+", type=str, default=["device:GPU:0"],
+                        help="If training on GPU, can specify your GPU names in a list - i.e 'device:GPU:0 device:GPU:1'")
+    parser.add_argument("--model", type=str, default=None, help="JSON file that contains model parameters.")
+    parser.add_argument("--steps_per_checkpoint", type=int, default=5000, help="Save a model checkpoint every X steps.")
+    parser.add_argument("--auto_layout", action="store_true", help="If set, generates and prints the most memory "
+                                                                   "efficient layout according to MTF auto layout.")
+    parser.add_argument("--auto_layout_and_mesh_shape", action="store_true",
+                        help="If set, generates and prints the most memory efficient layout and mesh shape according to"
+                             " MTF auto layout.")
+    parser.add_argument("--new", action="store_true", help="If set, deletes previous checkpoint, if it exists, and "
+                                                           "starts a new training run")
+    parser.add_argument("--predict", action="store_true", help="If set, uses the model to predict rather than train.")
+    parser.add_argument("--eval", action="store_true", help="If set, run model in evaluation mode.")
+    parser.add_argument("--prompt", type=str, help="path to .txt file containing a prompt for prediction. If empty, "
+                                                   "defaults to unicorns.",
+                        default="")
+    parser.add_argument("--check_dataset", action="store_true",
+                        help="If set, outputs sample from the dataset and quits.")
+    parser.add_argument("--sacred_id", type=str, default="nosacred", help="Sacred run id.")
+    parser.add_argument("--entmax_sampling", action="store_true", help="(experimental) use entmax sampling")
+    parser.add_argument("--export", action="store_true", help="If set, will export the model.")
+    args = parser.parse_args()
+    assert args.model is not None, "Model must be set"
+    return args
 
 
-def _int64_feature(value):
-    """
-    Returns an int64_list from a bool / enum / int / uint.
-    """
-    return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
+def main(args):
+    os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
+    
+    # Setup logging
+    logger = setup_logging(args)
+
+    # Read params of model
+    params = fetch_model_params(args.model)
+
+    # Fetch appropriate input functions
+    input_fn = params.get("input_fn", "sequential_input")
+    if input_fn == "sequential_input":
+        input_fn = sequential_input
+    elif input_fn == "generic_text":
+        input_fn = generic_text
+    pred_input_fn = pred_input
+    handle_pred_output_fn = handle_pred_output
+
+    # get current step
+    current_step = int(estimator_lib._load_global_step_from_checkpoint_dir(params["model_path"]))
+    logger.info(f"Current step {current_step}")
+
+    if params["mlm_training"]:
+        mlm_sample_text_fn = partial(mlm_sample_text, params)
+        input_fn = partial(generic_text, sample_text_fn=mlm_sample_text_fn)
+        if args.check_dataset:
+            check_dataset(input_fn, params)
 
 
-def write_to_file(writer, data):
-    """
-    writes data to tfrecord file
-    """
-    feature = {
-        "text": _int64_feature(data)
+    # Fetch encoder per params
+    encoder = fetch_encoder(params)
+
+    pred_input_fn = partial(pred_input_fn, path_to_prompt=args.prompt, logger=logger, enc=encoder)
+
+    # Sample from Dataset if check dataset flag is on
+    if args.check_dataset:
+        check_dataset(input_fn, params, global_step=current_step)
+
+    # Confirm deletion of checkpoint files if --new flag is set
+    if args.new:
+        if yes_or_no(f"Are you sure you want to remove '{params['model_path']}' to start afresh?"):
+            remove_gs_or_filepath(params["model_path"])
+        else:
+            exit()
+
+    # Save config to logdir for experiment management
+    save_config(params, params["model_path"])
+
+    # Add to params: auto_layout, auto_layout_and_mesh_shape, use_tpu, num_cores
+    mesh_shape = mtf.convert_to_shape(params["mesh_shape"])
+    params["num_cores"] = mesh_shape.size
+    params["auto_layout"] = args.auto_layout
+    params["auto_layout_and_mesh_shape"] = args.auto_layout_and_mesh_shape
+    params["use_tpu"] = True if not args.tpu is None else False
+    params["gpu_ids"] = args.gpu_ids
+    params["steps_per_checkpoint"] = args.steps_per_checkpoint
+    # Expand attention types param
+    params["attention_types"] = expand_attention_types_params(params["attention_types"])
+    assert len(params["attention_types"]) == params["n_layer"]  # Assert that the length of expanded list = num layers
+    params["predict_batch_size"] = params.get("predict_batch_size", 1)  # Default to 1
+    params["predict"] = args.predict
+    params['model'] = params.get("model", "GPT") # Default model selection to GPT since it's the only option for now
+    params["export"] = args.export
+    # Set sampling parameters
+    params["sampling_use_entmax"] = args.entmax_sampling
+
+    # Sample quality of MoE models suffers when using the faster sampling method, so default to slow_sampling if
+    # moe layers are present
+    params["slow_sampling"] = True if params["moe_layers"] is not None else False
+
+    logger.info(f"params = {params}")
+
+    # Get eval tasks from params
+    eval_tasks = params.get("eval_tasks", [])
+    has_predict_or_eval_steps_or_eval_tasks = params["predict_steps"] > 0 or params["eval_steps"] > 0 or len(
+        eval_tasks) > 0
+
+    for t in eval_tasks:
+        assert t in task_descriptors, f"Eval task '{t}' is not known"
+        task_descriptors[t]["init_fn"](params)
+
+    # Set up TPUs and Estimator
+    if args.tpu == "colab":
+        tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver() if params["use_tpu"] else None
+    else:
+        tpu_cluster_resolver = tf.distribute.cluster_resolver.TPUClusterResolver(args.tpu) if params["use_tpu"] else None
+
+    config = tpu_config.RunConfig(
+        cluster=tpu_cluster_resolver,
+        model_dir=params["model_path"],
+        save_checkpoints_steps=None,  # Disable the default saver
+        save_checkpoints_secs=None,  # Disable the default saver
+        log_step_count_steps=params["iterations"],
+        save_summary_steps=params["iterations"],
+        tpu_config=tpu_config.TPUConfig(
+            num_shards=mesh_shape.size,
+            iterations_per_loop=params["iterations"],
+            num_cores_per_replica=1,
+            per_host_input_for_training=tpu_config.InputPipelineConfig.BROADCAST))
+
+    estimator = tpu_estimator.TPUEstimator(
+        use_tpu=params["use_tpu"],
+        model_fn=model_fn,
+        config=config,
+        train_batch_size=params["train_batch_size"],
+        eval_batch_size=params["train_batch_size"],
+        predict_batch_size=params["predict_batch_size"],
+        params=params)
+
+    def _make_task_estimator(task):
+        task_params = params.copy()
+        task_params["eval_task"] = task
+        return tpu_estimator.TPUEstimator(
+            use_tpu=params["use_tpu"],
+            model_fn=model_fn,
+            config=config,
+            train_batch_size=params["train_batch_size"],
+            eval_batch_size=params["eval_batch_size"],
+            predict_batch_size=params["predict_batch_size"],
+            params=task_params)
+
+    eval_task_estimators = {
+        task: _make_task_estimator(task)
+        for task in eval_tasks
     }
-    tf_example = tf.train.Example(features=tf.train.Features(feature=feature))
-    writer.write(tf_example.SerializeToString())
 
-def get_tokenizer(args):
-    if args.encoder_path is None:
-        return GPT2TokenizerFast.from_pretrained('gpt2')
-    else:
-        #return Tokenizer.from_file(args.encoder_path)
-        return AutoTokenizer.from_pretrained(args.encoder_path)
-
-def split_list(l, n):
-    # splits list/string into n size chunks
-    return [l[i:i + n] for i in range(0, len(l), n)]
-
-
-def archive_to_tokens(f, encoder, args, prefix=[]):
-    # Generator that yields the contents of the files in an archive
-    # if data_to_prepend is not None, prepend data_to_prepend + a EOS separator to the encoded data
-    if ds is not None:
-        doc = f
-        if args.ftfy:  # fix text with ftfy if specified
-            doc = ftfy.fix_text(doc, normalization='NFKC')
-        if args.wikitext_detokenize:
-            doc = wikitext_detokenizer(doc)
-        doc = encoder.encode(doc) + args.separator  # read document from lmd and append separator token
-        yield split_list(prefix + doc, args.chunk_size)  # split into n_ctx + 1 size chunks
-        prefix = []
+    if args.export:
+        export_model(estimator, "export", params)
         return
-            
-    reader = Reader(f)
-    for doc in reader.stream_data(threaded=False):
-        if args.ftfy:  # fix text with ftfy if specified
-            doc = ftfy.fix_text(doc, normalization='NFKC')
-        if args.wikitext_detokenize:
-            doc = wikitext_detokenizer(doc)
-        doc = encoder.encode(doc) + args.separator  # read document from lmd and append separator token
-        yield split_list(prefix + doc, args.chunk_size)  # split into n_ctx + 1 size chunks
-        prefix = []
 
-
-def write_files(files, files_per, output_dir, out_name, start_no, write_remainder=False, process_no=None):
-    # writes a list of files to .tfrecords
-    if files == None:
+    if args.predict:
+        # Predict
+        predictions = estimator.predict(input_fn=pred_input_fn)
+        logger.info("Predictions generated")
+        enc = fetch_encoder(params)
+        handle_pred_output_fn(predictions, logger, enc, params, out_name=f"predictions_{args.sacred_id}_{current_step}")
         return
-    chunks = split_list(files, files_per)
-    if not chunks:
+
+    def save_eval_results(task, eval_results):
+        def as_python(x):
+            if isinstance(x, numpy.generic):
+                return x.item()
+            return x
+        eval_results = {k: as_python(v) for k, v in eval_results.items()}
+        with open(f'eval_{args.sacred_id}.jsonl', 'a') as fh:
+            json.dump({'task': task, 'current_step': current_step, **eval_results}, fh)
+            fh.write('\n')
+
+    def run_eval():
+        logger.info("Running evaluation...")
+        eval_results = estimator.evaluate(
+                input_fn=partial(input_fn, eval=True),
+                steps=params["eval_steps"])
+        logger.info(f"Eval results: {eval_results}")
+        save_eval_results('validation', eval_results)
+
+    def run_eval_tasks():
+        for task in eval_tasks:
+            logger.info(f"Starting evaluation task '{task}'")
+            task_info = task_descriptors[task]["get_task_info_fn"](params)
+            task_estimator = eval_task_estimators[task]
+            task_input_fn = task_descriptors[task]["input_fn"]
+            eval_results = task_estimator.evaluate(
+                input_fn=task_input_fn,
+                steps=task_info["n_steps"],
+                name=task)
+            logger.info(f"Eval task '{task}' results: {eval_results}")
+            save_eval_results(task, eval_results)
+    
+    if args.eval:
+        run_eval_tasks()
+        if params["eval_steps"] > 0:
+            run_eval()
         return
-      
-    if len(chunks[-1]) != files_per and not write_remainder:  # pop the last file if it's length != files per
-        remainder = chunks.pop(-1)
+
+
+    elif has_predict_or_eval_steps_or_eval_tasks:
+        # Eval and train - stop and predict and/or eval every checkpoint
+        while current_step < params["train_steps"]:
+            next_checkpoint = min(current_step + args.steps_per_checkpoint,
+                                  params["train_steps"])
+
+            estimator.train(input_fn=partial(input_fn, global_step=current_step, eval=False), max_steps=next_checkpoint)
+            current_step = next_checkpoint
+
+            if params["predict_steps"] > 0:
+                logger.info("Running prediction...")
+                predictions = estimator.predict(input_fn=pred_input_fn)
+                enc = fetch_encoder(params)
+                handle_pred_output_fn(predictions, logger, enc, params, out_name=f"predictions_{args.sacred_id}_{current_step}")
+
+            if params["eval_steps"] > 0:
+                run_eval()
+
+            if eval_tasks:
+                run_eval_tasks()
+                
+        return
     else:
-        remainder = None  # assuming files = remainder from an old chunk here
-        files_per = len(chunks[-1])
-
-    for files in chunks:
-        fp = f"{output_dir}/{out_name}_{start_no}"
-        if process_no is not None:
-            fp += f"_{process_no}"
-        fp += f"_{files_per}"  # add number of files in tfrecord to end of fp
-        fp += ".tfrecords"
-        with tf.io.TFRecordWriter(fp) as writer:
-            for f in files:
-                write_to_file(writer, f)
-        start_no += 1
-    return start_no, remainder
-
-
-def get_files(input_dir, filetypes=None):
-    # gets all files of <filetypes> in input_dir
-    if filetypes == None:
-        filetypes = ["jsonl.zst", ".txt", ".xz", ".tar.gz"]
-    files = [list(Path(input_dir).glob(f"*{ft}")) for ft in filetypes]
-    # flatten list of list -> list and stringify Paths
-    flattened_list = [str(item) for sublist in files for item in sublist]
-    if not flattened_list:
-        raise Exception(f"""did not find any files at this path {input_dir},\
- please also ensure your files are in format {filetypes}""")
-    return flattened_list
-
-
-def read_checkpoint(checkpoint_path, resume_from_checkpoint=True):
-    # init checkpointing
-    if resume_from_checkpoint and os.path.isfile(checkpoint_path):
-        try:
-            resume_files_processed, tfrecord_count = [int(i) for i in open(checkpoint_path, "r").read().split(", ")]
-            print(f"\nResuming from tfrecord no. {tfrecord_count} / file no. {resume_files_processed}")
-            return resume_files_processed, tfrecord_count
-        except:
-            pass
-    return 0, 0
-
-
-def create_tfrecords(params, write_remainder=True, write_every_n_files=1, save_checkpoints=False,
-                     resume_from_checkpoint=False, display_pbar=False):
-    # iterates through files in input_dir, splitting into <args.chunk_size> chunks and saving a tfrecords file every <args.files_per> chunks.
-    files, args, process_no = params
-    enc = get_tokenizer(args)  # get tokenizer
-
-    # init metadata
-    discarded_files = 0
-    files_processed = 0
-    pbar = tqdm(desc=f"Writing TFRecord Files to {args.output_dir}. Parsed 0 input files. files_written ",
-                disable=not display_pbar)
-    checkpoint_path = f"{args.output_dir}/checkpoint.txt"
-    resume_files_processed, tfrecord_count = read_checkpoint(checkpoint_path, resume_from_checkpoint)
-
-    data_to_prepend = []
-    tokenized_files_array = []
-
-    for f in files:
-        for tokenized_files in archive_to_tokens(f, enc, args, prefix=data_to_prepend):
-            files_processed += 1
-            if files_processed < resume_files_processed:
-                continue  # resume from checkpoint
-
-            # if the last chunk < chunk size, but > minimum_size, take it and append it to the beginning of the next file
-            data_to_prepend = []
-            n_tokens = len(tokenized_files[-1])
-            if n_tokens < args.chunk_size:
-                data = tokenized_files.pop(-1)
-                if n_tokens >= args.minimum_size:
-                    data_to_prepend = data
-                else:
-                    discarded_files += 1
-
-            # add tokenized files > chunk size to main array
-            tokenized_files_array.extend(tokenized_files)
-
-            if len(tokenized_files_array) >= args.files_per * write_every_n_files:  # write every n files
-                _tfrecord_count, remainder = write_files(tokenized_files_array, files_per=args.files_per,
-                                                         output_dir=args.output_dir, out_name=args.name,
-                                                         start_no=tfrecord_count, process_no=process_no)
-                pbar.update(_tfrecord_count - tfrecord_count)  # update progress bar
-                pbar.set_description(
-                    f"Writing TFRecord Files to {args.output_dir}. Parsed {files_processed} input files. files_written ")
-                tfrecord_count = _tfrecord_count
-                tokenized_files_array = remainder if remainder is not None else []  # add remaining files to next chunk
-                with open(checkpoint_path, "w") as checkpoint_file:
-                    checkpoint_file.write(f"{files_processed}, {tfrecord_count}")
-
-    if len(tokenized_files_array) >= args.files_per:  # also write at end
-        _tfrecord_count, remainder = write_files(tokenized_files_array, files_per=args.files_per,
-                                                 output_dir=args.output_dir, out_name=args.name,
-                                                 start_no=tfrecord_count, process_no=process_no)
-        pbar.update(_tfrecord_count - tfrecord_count)
-        pbar.set_description(
-            f"Writing TFRecord Files to {args.output_dir}. Parsed {files_processed} input files. files_written ")
-        tfrecord_count = _tfrecord_count
-        with open(checkpoint_path, "w") as checkpoint_file:
-            checkpoint_file.write(f"{files_processed}, {tfrecord_count}")
-    else:
-        remainder = tokenized_files_array  # add remaining to remainder
-
-    if write_remainder:
-        # write out the remaining files even if there's less than files_per
-        write_files(remainder, files_per=args.files_per, output_dir=args.output_dir, out_name=args.name,
-                    start_no=tfrecord_count, write_remainder=True)
-
-    successful_files = files_processed - discarded_files
-    return {"discarded": discarded_files, "processed": files_processed, "successful": successful_files}
-
-
-def create_tfrecords_mp(files, args):
-    files = split_list(files, len(files) // args.processes)
-    with Pool(processes=args.processes) as pool:
-        pbar = tqdm(pool.imap(create_tfrecords, zip(files, repeat(args), range(len(files)))))
-        meta = {"discarded": 0, "processed": 0, "successful": 0}
-        for results in pbar:
-            pbar.update()
-            for k, v in results.items():
-                meta[k] += v  # update metadata
-        return meta
+        # Else, just train
+        while current_step < params["train_steps"]:
+            # Else, don't stop and restart
+            estimator.train(input_fn=partial(input_fn, global_step=current_step, eval=False), max_steps=params["train_steps"])
 
 
 if __name__ == "__main__":
-    os.makedirs(args.output_dir, exist_ok=True)  # make output dir if it doesn't exist
-    if args.from_hf_dataset is not None:
-        ds = load_dataset(args.from_hf_dataset)
-        ds = ds["train"]
-        files = [id for id in ds['text']]
-    else:
-        files = get_files(args.input_dir)
-    args.chunk_size += 1  # we shift the data by 1 to the right for targets, so increment the chunk size here
-
-    if args.processes == 0:
-        args.processes = cpu_count()
-    if args.processes > 1:
-        results = create_tfrecords_mp(files, args)
-    else:
-        results = create_tfrecords((files, args, 0), display_pbar=True)
-    print(results)
+    tf.disable_v2_behavior()
+    args = parse_args()
+    main(args)
