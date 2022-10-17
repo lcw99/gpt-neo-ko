@@ -1,1 +1,8 @@
 {"task": "validation", "current_step": 10000, "bits per byte": 2.920071601867676, "loss": 6.899747848510742, "mean_logits": -3.9494097232818604, "perplexity": 1069.2183837890625, "global_step": 10000}
+{"task": "validation", "current_step": 20000, "bits per byte": 2.606262445449829, "loss": 6.158249855041504, "mean_logits": -3.7722151279449463, "perplexity": 529.4916381835938, "global_step": 20000}
+{"task": "validation", "current_step": 10000, "bits per byte": 3.279198169708252, "loss": 7.7483086585998535, "mean_logits": -4.918227672576904, "perplexity": 2458.294677734375, "global_step": 10000}
+{"task": "validation", "current_step": 20000, "bits per byte": 3.494718074798584, "loss": 8.257552146911621, "mean_logits": -6.080439567565918, "perplexity": 3987.326904296875, "global_step": 20000}
+{"task": "validation", "current_step": 30000, "bits per byte": 3.5784761905670166, "loss": 8.455483436584473, "mean_logits": -6.221377372741699, "perplexity": 4819.18798828125, "global_step": 30000}
+{"task": "validation", "current_step": 40000, "bits per byte": 3.47206449508667, "loss": 8.204023361206055, "mean_logits": -6.15744161605835, "perplexity": 3798.958984375, "global_step": 40000}
+{"task": "validation", "current_step": 50000, "bits per byte": 3.439436435699463, "loss": 8.126943588256836, "mean_logits": -6.855533123016357, "perplexity": 3544.693603515625, "global_step": 50000}
+{"task": "validation", "current_step": 60000, "bits per byte": 3.446772813796997, "loss": 8.144265174865723, "mean_logits": -6.486729621887207, "perplexity": 3578.644775390625, "global_step": 60000}

@@ -114,5 +114,5 @@ test/
 
 
 run_configs/
-neo-models/
+gpt-neo-models/
 tf-data-*/

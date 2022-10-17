@@ -27,11 +27,13 @@
     "scale_by_in": false,
     "attention_types" :  [[["global"],12]],
     "activation_function": "gelu",
-    "layout": "batch:all",
-    "recompute_grad": false,
     "gradient_clipping": 1.0,
-    "model_path": "/home/chang/nas1/linux/gpt-neo-models/GPT2_SMALL_TEST",
+
+    "recompute_grad": true,
+    "model_path": "./gpt-neo-models/GPT2_SMALL_BF16",
     "mesh_shape": "x:1,y:2",
+    "layout": "batch:x,embd:y,memory_length:y",
     "datasets": [["datasets", 8, "documents_random", 1.0]],
-    "tokens_per_mb_per_replica": 128
+    "tokens_per_mb_per_replica": 2048,
+    "precision": "bfloat16"
 }

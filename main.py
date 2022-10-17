@@ -50,6 +50,7 @@ def parse_args():
 
 def main(args):
     os.environ['TF_XLA_FLAGS'] = '--tf_xla_enable_xla_devices'
+    #os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2'
     
     # Setup logging
     logger = setup_logging(args)

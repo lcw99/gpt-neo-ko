@@ -1,6 +1,6 @@
 {
     "n_vocab": 50257,
-    "path": "./tf-data-wiki-kor-bpe/*.tfrecords",
-    "eval_path": "./tf-data-wiki-kor-bpe-eval/*.tfrecords",
+    "path": "/home/chang/nas1/linux/dataset/text/gpt-neo/tf-data-namu-kor-bpe/*.tfrecords",
+    "eval_path": "/home/chang/nas1/linux/dataset/text/gpt-neo/tf-data-kor-eval/*.tfrecords",
     "tokenizer_path": "./tokenizer-wiki-plus-namu-gpt-neo-ko/tokenizer.json"
 }
